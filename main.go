@@ -15,12 +15,11 @@ import (
 
 func main() {
 	var (
-		usersFile       = flag.String("users-file", "", "Path to a file containing SSH usernames (one per line)")
-		passwordsFile   = flag.String("passwords-file", "", "Path to a file containing SSH passwords (one per line)")
-		credentialsFile = flag.String("credentials-file", "", "Path to a file containing SSH username/password pairs")
-		hostsFile       = flag.String("hosts-file", "", "Path to a file containing SSH hosts (one per line, optional :port)")
-		port            = flag.Int("port", 22, "SSH server port")
-		output          = flag.String("output", "good.txt", "Path to the file where credentials will be saved")
+		usersFile     = flag.String("users-file", "", "Path to a file containing SSH usernames (one per line)")
+		passwordsFile = flag.String("passwords-file", "", "Path to a file containing SSH passwords (one per line)")
+		hostsFile     = flag.String("hosts-file", "", "Path to a file containing SSH hosts (one per line, optional :port)")
+		port          = flag.Int("port", 22, "SSH server port")
+		output        = flag.String("output", "good.txt", "Path to the file where credentials will be saved")
 	)
 
 	flag.Parse()
@@ -30,7 +29,7 @@ func main() {
 		log.Fatal(err)
 	}
 
-	credentials, err := gatherCredentials(*credentialsFile, *usersFile, *passwordsFile)
+	credentials, err := gatherCredentials(*usersFile, *passwordsFile)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -116,52 +115,38 @@ func loadHosts(hostsFile string) ([]string, error) {
 	return hosts, nil
 }
 
-func gatherCredentials(credentialsFile, usersFile, passwordsFile string) ([]credential, error) {
+func gatherCredentials(usersFile, passwordsFile string) ([]credential, error) {
 	var credentials []credential
-
-	if strings.TrimSpace(credentialsFile) != "" {
-		fileCreds, err := loadCredentialPairs(credentialsFile)
-		if err != nil {
-			return nil, err
-		}
-		credentials = append(credentials, fileCreds...)
-	}
 
 	usersFile = strings.TrimSpace(usersFile)
 	passwordsFile = strings.TrimSpace(passwordsFile)
 
-	if usersFile != "" || passwordsFile != "" {
-		if usersFile == "" || passwordsFile == "" {
-			return nil, fmt.Errorf("both users-file and passwords-file must be provided together")
-		}
-
-		users, err := loadEntries(usersFile, false)
-		if err != nil {
-			return nil, fmt.Errorf("failed to read users file: %w", err)
-		}
-
-		passwords, err := loadEntries(passwordsFile, true)
-		if err != nil {
-			return nil, fmt.Errorf("failed to read passwords file: %w", err)
-		}
-
-		if len(users) == 0 {
-			return nil, fmt.Errorf("users file is empty")
-		}
-
-		if len(passwords) == 0 {
-			return nil, fmt.Errorf("passwords file is empty")
-		}
-
-		for _, user := range users {
-			for _, password := range passwords {
-				credentials = append(credentials, credential{user: user, password: password})
-			}
-		}
+	if usersFile == "" || passwordsFile == "" {
+		return nil, fmt.Errorf("both users-file and passwords-file must be provided")
 	}
 
-	if len(credentials) == 0 {
-		return nil, fmt.Errorf("no credentials provided")
+	users, err := loadEntries(usersFile, false)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read users file: %w", err)
+	}
+
+	passwords, err := loadEntries(passwordsFile, true)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read passwords file: %w", err)
+	}
+
+	if len(users) == 0 {
+		return nil, fmt.Errorf("users file is empty")
+	}
+
+	if len(passwords) == 0 {
+		return nil, fmt.Errorf("passwords file is empty")
+	}
+
+	for _, user := range users {
+		for _, password := range passwords {
+			credentials = append(credentials, credential{user: user, password: password})
+		}
 	}
 
 	return credentials, nil
@@ -193,49 +178,4 @@ func loadEntries(path string, preserveSpaces bool) ([]string, error) {
 	}
 
 	return entries, nil
-}
-
-func loadCredentialPairs(path string) ([]credential, error) {
-	entries, err := loadEntries(path, true)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read credentials file: %w", err)
-	}
-
-	if len(entries) == 0 {
-		return nil, fmt.Errorf("credentials file is empty")
-	}
-
-	var credentials []credential
-	for _, entry := range entries {
-		trimmed := strings.TrimSpace(entry)
-		if trimmed == "" {
-			continue
-		}
-
-		var user, password string
-		if strings.Contains(trimmed, ":") {
-			parts := strings.SplitN(trimmed, ":", 2)
-			user = strings.TrimSpace(parts[0])
-			password = strings.TrimSpace(parts[1])
-		} else {
-			fields := strings.Fields(trimmed)
-			if len(fields) < 2 {
-				return nil, fmt.Errorf("credentials file must contain entries formatted as 'user:password' or 'user password'")
-			}
-			user = fields[0]
-			password = strings.Join(fields[1:], " ")
-		}
-
-		if user == "" {
-			return nil, fmt.Errorf("credentials file entry missing username")
-		}
-
-		credentials = append(credentials, credential{user: user, password: password})
-	}
-
-	if len(credentials) == 0 {
-		return nil, fmt.Errorf("credentials file is empty")
-	}
-
-	return credentials, nil
 }
