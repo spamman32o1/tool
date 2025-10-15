@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"math/rand"
 	"net"
@@ -11,6 +12,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -71,32 +73,8 @@ func main() {
 		}
 	}()
 
-	for _, hostEntry := range hosts {
-		hostEntry = strings.TrimSpace(hostEntry)
-		if hostEntry == "" {
-			continue
-		}
-
-		currentHost := hostEntry
-		currentPort := cfg.port
-
-		if strings.Contains(hostEntry, ":") {
-			if h, p, err := net.SplitHostPort(hostEntry); err == nil {
-				currentHost = h
-				portNum, err := strconv.Atoi(p)
-				if err != nil {
-					log.Fatalf("invalid port in host entry %q: %v", hostEntry, err)
-				}
-				currentPort = portNum
-			}
-		}
-
-		for _, credential := range credentials {
-			line := fmt.Sprintf("%s|%d|%s|%s", currentHost, currentPort, credential.user, credential.password)
-			if _, err := fmt.Fprintln(writer, line); err != nil {
-				log.Fatalf("failed to write credentials: %v", err)
-			}
-		}
+	if err := processHosts(cfg, hosts, credentials, writer); err != nil {
+		log.Fatal(err)
 	}
 }
 
@@ -109,6 +87,100 @@ type processingConfig struct {
 type credential struct {
 	user     string
 	password string
+}
+
+type hostTarget struct {
+	host string
+	port int
+}
+
+type credentialJob struct {
+	target     hostTarget
+	credential credential
+}
+
+func processHosts(cfg processingConfig, hosts []string, credentials []credential, output io.Writer) error {
+	parsedHosts := make([]hostTarget, 0, len(hosts))
+	for _, hostEntry := range hosts {
+		hostEntry = strings.TrimSpace(hostEntry)
+		if hostEntry == "" {
+			continue
+		}
+
+		currentHost := hostEntry
+		currentPort := cfg.port
+
+		if strings.Contains(hostEntry, ":") {
+			h, p, err := net.SplitHostPort(hostEntry)
+			if err != nil {
+				return fmt.Errorf("invalid host entry %q: %w", hostEntry, err)
+			}
+
+			portNum, err := strconv.Atoi(p)
+			if err != nil {
+				return fmt.Errorf("invalid port in host entry %q: %w", hostEntry, err)
+			}
+
+			currentHost = h
+			currentPort = portNum
+		}
+
+		parsedHosts = append(parsedHosts, hostTarget{host: currentHost, port: currentPort})
+	}
+
+	if len(parsedHosts) == 0 {
+		return fmt.Errorf("no valid hosts provided")
+	}
+
+	jobBuffer := cfg.workers * 4
+	if jobBuffer < 1 {
+		jobBuffer = 1
+	}
+
+	jobs := make(chan credentialJob, jobBuffer)
+	lines := make(chan string, jobBuffer)
+
+	var workersWG sync.WaitGroup
+	for i := 0; i < cfg.workers; i++ {
+		workersWG.Add(1)
+		go func() {
+			defer workersWG.Done()
+			for job := range jobs {
+				line := fmt.Sprintf("%s|%d|%s|%s", job.target.host, job.target.port, job.credential.user, job.credential.password)
+				lines <- line
+			}
+		}()
+	}
+
+	errCh := make(chan error, 1)
+	go func() {
+		var writeErr error
+		for line := range lines {
+			if writeErr != nil {
+				continue
+			}
+			if _, err := fmt.Fprintln(output, line); err != nil {
+				writeErr = fmt.Errorf("failed to write credentials: %w", err)
+			}
+		}
+		errCh <- writeErr
+	}()
+
+	for _, host := range parsedHosts {
+		for _, cred := range credentials {
+			jobs <- credentialJob{target: host, credential: cred}
+		}
+	}
+
+	close(jobs)
+	workersWG.Wait()
+	close(lines)
+
+	if err := <-errCh; err != nil {
+		return err
+	}
+
+	return nil
 }
 
 func loadHosts(hostsFile string) ([]string, error) {
