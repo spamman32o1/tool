@@ -8,6 +8,7 @@ import (
 	"math/rand"
 	"net"
 	"os"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -20,9 +21,22 @@ func main() {
 		hostsFile     = flag.String("hosts-file", "", "Path to a file containing SSH hosts (one per line, optional :port)")
 		port          = flag.Int("port", 22, "SSH server port")
 		output        = flag.String("output", "good.txt", "Path to the file where credentials will be saved")
+		workers       = flag.Int("workers", runtime.NumCPU(), "Number of concurrent workers to use when processing hosts")
 	)
 
 	flag.Parse()
+
+	if *workers < 1 {
+		fmt.Fprintln(os.Stderr, "workers must be at least 1")
+		flag.Usage()
+		os.Exit(2)
+	}
+
+	cfg := processingConfig{
+		port:    *port,
+		workers: *workers,
+		output:  *output,
+	}
 
 	hosts, err := loadHosts(*hostsFile)
 	if err != nil {
@@ -44,11 +58,18 @@ func main() {
 		credentials[i], credentials[j] = credentials[j], credentials[i]
 	})
 
-	f, err := os.OpenFile(*output, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+	f, err := os.OpenFile(cfg.output, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
 	if err != nil {
 		log.Fatalf("failed to open output file: %v", err)
 	}
 	defer f.Close()
+
+	writer := bufio.NewWriterSize(f, cfg.workers*1024)
+	defer func() {
+		if err := writer.Flush(); err != nil {
+			log.Fatalf("failed to flush output: %v", err)
+		}
+	}()
 
 	for _, hostEntry := range hosts {
 		hostEntry = strings.TrimSpace(hostEntry)
@@ -57,7 +78,7 @@ func main() {
 		}
 
 		currentHost := hostEntry
-		currentPort := *port
+		currentPort := cfg.port
 
 		if strings.Contains(hostEntry, ":") {
 			if h, p, err := net.SplitHostPort(hostEntry); err == nil {
@@ -72,11 +93,17 @@ func main() {
 
 		for _, credential := range credentials {
 			line := fmt.Sprintf("%s|%d|%s|%s", currentHost, currentPort, credential.user, credential.password)
-			if _, err := fmt.Fprintln(f, line); err != nil {
+			if _, err := fmt.Fprintln(writer, line); err != nil {
 				log.Fatalf("failed to write credentials: %v", err)
 			}
 		}
 	}
+}
+
+type processingConfig struct {
+	port    int
+	workers int
+	output  string
 }
 
 type credential struct {
