@@ -5,8 +5,7 @@ import (
 	"fmt"
 	"log"
 	"os"
-
-	"golang.org/x/crypto/ssh"
+	"strings"
 )
 
 func main() {
@@ -16,6 +15,7 @@ func main() {
 		passwordFile = flag.String("password-file", "", "Path to a file containing the SSH password")
 		host         = flag.String("host", "", "SSH server hostname or IP (required)")
 		port         = flag.Int("port", 22, "SSH server port")
+		output       = flag.String("output", "good.txt", "Path to the file where credentials will be saved")
 	)
 
 	flag.Parse()
@@ -34,51 +34,20 @@ func main() {
 		pass = string(data)
 	}
 
+	pass = strings.TrimRight(pass, "\r\n")
+
 	if pass == "" {
 		log.Fatal("no password provided (use -password or -password-file)")
 	}
 
-	config := &ssh.ClientConfig{
-		User: *user,
-		Auth: []ssh.AuthMethod{
-			ssh.Password(pass),
-		},
-		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
-	}
-
-	address := fmt.Sprintf("%s:%d", *host, *port)
-
-	client, err := ssh.Dial("tcp", address, config)
+	f, err := os.OpenFile(*output, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
 	if err != nil {
-		log.Fatalf("failed to connect to %s: %v", address, err)
+		log.Fatalf("failed to open output file: %v", err)
 	}
-	defer client.Close()
+	defer f.Close()
 
-	session, err := client.NewSession()
-	if err != nil {
-		log.Fatalf("failed to create session: %v", err)
-	}
-	defer session.Close()
-
-	session.Stdin = os.Stdin
-	session.Stdout = os.Stdout
-	session.Stderr = os.Stderr
-
-	modes := ssh.TerminalModes{
-		ssh.ECHO:          1,
-		ssh.TTY_OP_ISPEED: 14400,
-		ssh.TTY_OP_OSPEED: 14400,
-	}
-
-	if err := session.RequestPty("xterm", 80, 40, modes); err != nil {
-		log.Fatalf("failed to request PTY: %v", err)
-	}
-
-	if err := session.Shell(); err != nil {
-		log.Fatalf("failed to start shell: %v", err)
-	}
-
-	if err := session.Wait(); err != nil {
-		log.Fatalf("session ended with error: %v", err)
+	credential := fmt.Sprintf("%s|%d|%s|%s", *host, *port, *user, pass)
+	if _, err := f.WriteString(credential); err != nil {
+		log.Fatalf("failed to write credentials: %v", err)
 	}
 }
