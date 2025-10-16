@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"flag"
 	"fmt"
 	"io"
@@ -24,6 +25,7 @@ func main() {
 		port          = flag.Int("port", 22, "SSH server port")
 		output        = flag.String("output", "good.txt", "Path to the file where credentials will be saved")
 		workers       = flag.Int("workers", runtime.NumCPU(), "Number of concurrent workers to use when processing hosts")
+		probeTimeout  = flag.Duration("probe-timeout", 0, "Timeout used when probing hosts before queuing them (0 to disable)")
 	)
 
 	flag.Parse()
@@ -35,9 +37,10 @@ func main() {
 	}
 
 	cfg := processingConfig{
-		port:    *port,
-		workers: *workers,
-		output:  *output,
+		port:         *port,
+		workers:      *workers,
+		output:       *output,
+		probeTimeout: *probeTimeout,
 	}
 
 	hosts, err := loadHosts(*hostsFile)
@@ -78,10 +81,14 @@ func main() {
 	}
 }
 
+type dialContextFunc func(ctx context.Context, network, address string) (net.Conn, error)
+
 type processingConfig struct {
-	port    int
-	workers int
-	output  string
+	port         int
+	workers      int
+	output       string
+	probeTimeout time.Duration
+	dialContext  dialContextFunc
 }
 
 type credential struct {
@@ -101,6 +108,7 @@ type credentialJob struct {
 
 func processHosts(cfg processingConfig, hosts []string, credentials []credential, output io.Writer) error {
 	parsedHosts := make([]hostTarget, 0, len(hosts))
+	seenTargets := make(map[string]struct{})
 	for _, hostEntry := range hosts {
 		hostEntry = strings.TrimSpace(hostEntry)
 		if hostEntry == "" {
@@ -125,11 +133,30 @@ func processHosts(cfg processingConfig, hosts []string, credentials []credential
 			currentPort = portNum
 		}
 
-		parsedHosts = append(parsedHosts, hostTarget{host: currentHost, port: currentPort})
+		targets, err := expandHostTargets(currentHost, currentPort)
+		if err != nil {
+			return err
+		}
+
+		for _, target := range targets {
+			key := makeTargetKey(target)
+			if _, exists := seenTargets[key]; exists {
+				continue
+			}
+			responsive, err := cfg.probeTarget(target)
+			if err != nil {
+				return err
+			}
+			if !responsive {
+				continue
+			}
+			seenTargets[key] = struct{}{}
+			parsedHosts = append(parsedHosts, target)
+		}
 	}
 
 	if len(parsedHosts) == 0 {
-		return fmt.Errorf("no valid hosts provided")
+		return fmt.Errorf("no valid hosts provided after resolution and probing")
 	}
 
 	jobBuffer := cfg.workers * 4
@@ -181,6 +208,64 @@ func processHosts(cfg processingConfig, hosts []string, credentials []credential
 	}
 
 	return nil
+}
+
+func expandHostTargets(host string, port int) ([]hostTarget, error) {
+	targets := []hostTarget{{host: host, port: port}}
+	if ip := net.ParseIP(host); ip != nil {
+		return targets, nil
+	}
+
+	resolved, err := net.LookupIP(host)
+	if err != nil {
+		return nil, fmt.Errorf("failed to resolve host %q: %w", host, err)
+	}
+
+	for _, ip := range resolved {
+		targets = append(targets, hostTarget{host: ip.String(), port: port})
+	}
+
+	return targets, nil
+}
+
+func makeTargetKey(target hostTarget) string {
+	return fmt.Sprintf("%s|%d", target.host, target.port)
+}
+
+func (cfg processingConfig) shouldProbe() bool {
+	return cfg.probeTimeout > 0 || cfg.dialContext != nil
+}
+
+func (cfg processingConfig) probeTarget(target hostTarget) (bool, error) {
+	if !cfg.shouldProbe() {
+		return true, nil
+	}
+
+	address := net.JoinHostPort(target.host, strconv.Itoa(target.port))
+
+	var (
+		ctx    = context.Background()
+		cancel context.CancelFunc
+	)
+
+	if cfg.probeTimeout > 0 {
+		ctx, cancel = context.WithTimeout(ctx, cfg.probeTimeout)
+		defer cancel()
+	}
+
+	dialer := cfg.dialContext
+	if dialer == nil {
+		d := &net.Dialer{Timeout: cfg.probeTimeout}
+		dialer = d.DialContext
+	}
+
+	conn, err := dialer(ctx, "tcp", address)
+	if err != nil {
+		return false, nil
+	}
+	defer conn.Close()
+
+	return true, nil
 }
 
 func loadHosts(hostsFile string) ([]string, error) {
