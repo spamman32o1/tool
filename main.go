@@ -17,6 +17,8 @@ import (
 	"time"
 )
 
+var fallbackPorts = []int{22, 2222, 2200, 222, 2022, 8022, 80, 443}
+
 func main() {
 	var (
 		usersFile     = flag.String("users-file", "", "Path to a file containing SSH usernames (one per line)")
@@ -131,6 +133,15 @@ func processHosts(cfg processingConfig, hosts []string, credentials []credential
 
 			currentHost = h
 			currentPort = portNum
+		} else {
+			selectedPort, err := cfg.selectResponsivePort(currentHost)
+			if err != nil {
+				return err
+			}
+			if selectedPort == 0 {
+				continue
+			}
+			currentPort = selectedPort
 		}
 
 		targets, err := expandHostTargets(currentHost, currentPort)
@@ -241,6 +252,10 @@ func (cfg processingConfig) probeTarget(target hostTarget) (bool, error) {
 		return true, nil
 	}
 
+	return cfg.probeTargetWithTimeout(target, cfg.probeTimeout)
+}
+
+func (cfg processingConfig) probeTargetWithTimeout(target hostTarget, timeout time.Duration) (bool, error) {
 	address := net.JoinHostPort(target.host, strconv.Itoa(target.port))
 
 	var (
@@ -248,14 +263,14 @@ func (cfg processingConfig) probeTarget(target hostTarget) (bool, error) {
 		cancel context.CancelFunc
 	)
 
-	if cfg.probeTimeout > 0 {
-		ctx, cancel = context.WithTimeout(ctx, cfg.probeTimeout)
+	if timeout > 0 {
+		ctx, cancel = context.WithTimeout(ctx, timeout)
 		defer cancel()
 	}
 
 	dialer := cfg.dialContext
 	if dialer == nil {
-		d := &net.Dialer{Timeout: cfg.probeTimeout}
+		d := &net.Dialer{Timeout: timeout}
 		dialer = d.DialContext
 	}
 
@@ -266,6 +281,54 @@ func (cfg processingConfig) probeTarget(target hostTarget) (bool, error) {
 	defer conn.Close()
 
 	return true, nil
+}
+
+func (cfg processingConfig) selectResponsivePort(host string) (int, error) {
+	priorities := cfg.portPriorities()
+	if !cfg.shouldProbe() {
+		if len(priorities) == 0 {
+			return 0, nil
+		}
+		return priorities[0], nil
+	}
+
+	probeTimeout := cfg.probeTimeout
+	if probeTimeout <= 0 {
+		probeTimeout = 2 * time.Second
+	}
+
+	for _, port := range priorities {
+		responsive, err := cfg.probeTargetWithTimeout(hostTarget{host: host, port: port}, probeTimeout)
+		if err != nil {
+			return 0, err
+		}
+		if responsive {
+			return port, nil
+		}
+	}
+
+	return 0, nil
+}
+
+func (cfg processingConfig) portPriorities() []int {
+	priorities := make([]int, 0, len(fallbackPorts)+1)
+	seen := make(map[int]struct{}, len(fallbackPorts)+1)
+
+	addPort := func(port int) {
+		if _, exists := seen[port]; exists {
+			return
+		}
+		seen[port] = struct{}{}
+		priorities = append(priorities, port)
+	}
+
+	addPort(cfg.port)
+
+	for _, port := range fallbackPorts {
+		addPort(port)
+	}
+
+	return priorities
 }
 
 func loadHosts(hostsFile string) ([]string, error) {

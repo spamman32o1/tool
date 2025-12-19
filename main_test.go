@@ -189,3 +189,61 @@ func TestProcessHostsInvalidHost(t *testing.T) {
 		t.Fatal("expected error for invalid host entry, got nil")
 	}
 }
+
+func TestProcessHostsUsesFallbackPorts(t *testing.T) {
+	cfg := processingConfig{port: 22, workers: 1, probeTimeout: 5 * time.Millisecond}
+
+	var attempts []string
+	cfg.dialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
+		attempts = append(attempts, address)
+		switch {
+		case strings.HasSuffix(address, ":22"), strings.HasSuffix(address, ":2222"):
+			return nil, fmt.Errorf("closed: %s", address)
+		case strings.HasSuffix(address, ":2200"):
+			client, server := net.Pipe()
+			server.Close()
+			return client, nil
+		default:
+			return nil, fmt.Errorf("closed: %s", address)
+		}
+	}
+
+	hosts := []string{"192.0.2.10"}
+	credentials := []credential{{user: "fallback", password: "check"}}
+
+	var buf bytes.Buffer
+	writer := bufio.NewWriter(&buf)
+
+	if err := processHosts(cfg, hosts, credentials, writer); err != nil {
+		t.Fatalf("processHosts returned unexpected error: %v", err)
+	}
+
+	if err := writer.Flush(); err != nil {
+		t.Fatalf("failed to flush writer: %v", err)
+	}
+
+	lines := strings.Split(strings.TrimSpace(buf.String()), "\n")
+	if len(lines) != 1 {
+		t.Fatalf("expected exactly one credential line, got %d: %v", len(lines), lines)
+	}
+
+	expectedLine := "192.0.2.10|2200|fallback|check"
+	if lines[0] != expectedLine {
+		t.Fatalf("unexpected credential line: %q", lines[0])
+	}
+
+	expectedAttempts := []string{"192.0.2.10:22", "192.0.2.10:2222", "192.0.2.10:2200"}
+	if len(attempts) < len(expectedAttempts) {
+		t.Fatalf("expected at least attempts %v, got %v", expectedAttempts, attempts)
+	}
+
+	for i, attempt := range expectedAttempts {
+		if attempts[i] != attempt {
+			t.Fatalf("unexpected probe order at position %d: got %s want %s", i, attempts[i], attempt)
+		}
+	}
+
+	if last := attempts[len(attempts)-1]; last != "192.0.2.10:2200" {
+		t.Fatalf("expected final probe against chosen port, got %s", last)
+	}
+}
