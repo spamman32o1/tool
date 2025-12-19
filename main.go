@@ -84,13 +84,15 @@ func main() {
 }
 
 type dialContextFunc func(ctx context.Context, network, address string) (net.Conn, error)
+type authenticatorFunc func(ctx context.Context, target hostTarget, cred credential) (bool, error)
 
 type processingConfig struct {
-	port         int
-	workers      int
-	output       string
-	probeTimeout time.Duration
-	dialContext  dialContextFunc
+	port          int
+	workers       int
+	output        string
+	probeTimeout  time.Duration
+	dialContext   dialContextFunc
+	authenticator authenticatorFunc
 }
 
 type credential struct {
@@ -177,6 +179,7 @@ func processHosts(cfg processingConfig, hosts []string, credentials []credential
 
 	jobs := make(chan credentialJob, jobBuffer)
 	lines := make(chan string, jobBuffer)
+	workerErrCh := make(chan error, 1)
 
 	var workersWG sync.WaitGroup
 	for i := 0; i < cfg.workers; i++ {
@@ -184,8 +187,19 @@ func processHosts(cfg processingConfig, hosts []string, credentials []credential
 		go func() {
 			defer workersWG.Done()
 			for job := range jobs {
-				line := fmt.Sprintf("%s|%d|%s|%s", job.target.host, job.target.port, job.credential.user, job.credential.password)
-				lines <- line
+				success, err := cfg.authenticateCredential(job.target, job.credential)
+				if err != nil {
+					select {
+					case workerErrCh <- err:
+					default:
+					}
+					return
+				}
+
+				if success {
+					line := fmt.Sprintf("%s|%d|%s|%s", job.target.host, job.target.port, job.credential.user, job.credential.password)
+					lines <- line
+				}
 			}
 		}()
 	}
@@ -214,8 +228,23 @@ func processHosts(cfg processingConfig, hosts []string, credentials []credential
 	workersWG.Wait()
 	close(lines)
 
-	if err := <-errCh; err != nil {
-		return err
+	workerErr := func() error {
+		select {
+		case err := <-workerErrCh:
+			return err
+		default:
+			return nil
+		}
+	}()
+
+	writeErr := <-errCh
+
+	if workerErr != nil {
+		return workerErr
+	}
+
+	if writeErr != nil {
+		return writeErr
 	}
 
 	return nil
@@ -253,6 +282,16 @@ func (cfg processingConfig) probeTarget(target hostTarget) (bool, error) {
 	}
 
 	return cfg.probeTargetWithTimeout(target, cfg.probeTimeout)
+}
+
+func (cfg processingConfig) authenticateCredential(target hostTarget, cred credential) (bool, error) {
+	authenticator := cfg.authenticator
+	if authenticator == nil {
+		authenticator = defaultAuthenticator(cfg.probeTimeout)
+	}
+
+	ctx := context.Background()
+	return authenticator(ctx, target, cred)
 }
 
 func (cfg processingConfig) probeTargetWithTimeout(target hostTarget, timeout time.Duration) (bool, error) {
@@ -329,6 +368,60 @@ func (cfg processingConfig) portPriorities() []int {
 	}
 
 	return priorities
+}
+
+func defaultAuthenticator(timeout time.Duration) authenticatorFunc {
+	if timeout <= 0 {
+		timeout = 5 * time.Second
+	}
+
+	return func(ctx context.Context, target hostTarget, cred credential) (bool, error) {
+		if ctx == nil {
+			ctx = context.Background()
+		}
+
+		address := net.JoinHostPort(target.host, strconv.Itoa(target.port))
+		dialer := &net.Dialer{Timeout: timeout}
+
+		conn, err := dialer.DialContext(ctx, "tcp", address)
+		if err != nil {
+			return false, nil
+		}
+		defer conn.Close()
+
+		if err := conn.SetDeadline(time.Now().Add(timeout)); err != nil {
+			return false, err
+		}
+
+		if _, err := io.WriteString(conn, "SSH-2.0-credential-check\r\n"); err != nil {
+			return false, nil
+		}
+
+		bannerBuf := make([]byte, 256)
+		n, err := conn.Read(bannerBuf)
+		if err != nil {
+			return false, nil
+		}
+
+		banner := strings.ToLower(string(bannerBuf[:n]))
+		if !strings.Contains(banner, "ssh") {
+			return false, nil
+		}
+
+		authPayload := fmt.Sprintf("%s\n%s\n", cred.user, cred.password)
+		if _, err := conn.Write([]byte(authPayload)); err != nil {
+			return false, nil
+		}
+
+		resultBuf := make([]byte, 256)
+		n, err = conn.Read(resultBuf)
+		if err != nil {
+			return false, nil
+		}
+
+		result := strings.ToLower(string(resultBuf[:n]))
+		return strings.Contains(result, "success"), nil
+	}
 }
 
 func loadHosts(hostsFile string) ([]string, error) {
