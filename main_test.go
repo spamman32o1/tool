@@ -13,6 +13,9 @@ import (
 
 func TestProcessHostsGeneratesAllLines(t *testing.T) {
 	cfg := processingConfig{port: 22, workers: 3}
+	cfg.authenticator = func(ctx context.Context, target hostTarget, cred credential) (bool, error) {
+		return true, nil
+	}
 	hosts := []string{"203.0.113.10", "10.0.0.1:2200", "   198.51.100.5  "}
 	credentials := []credential{
 		{user: "alice", password: "wonder"},
@@ -63,6 +66,9 @@ func TestProcessHostsGeneratesAllLines(t *testing.T) {
 
 func TestProcessHostsResolvesDomain(t *testing.T) {
 	cfg := processingConfig{port: 22, workers: 2}
+	cfg.authenticator = func(ctx context.Context, target hostTarget, cred credential) (bool, error) {
+		return true, nil
+	}
 	hosts := []string{"localhost", " localhost "}
 	credentials := []credential{{user: "user", password: "pass"}}
 
@@ -116,6 +122,9 @@ func TestProcessHostsProbingSkipsUnresponsive(t *testing.T) {
 		port:         2200,
 		workers:      1,
 		probeTimeout: 5 * time.Millisecond,
+	}
+	cfg.authenticator = func(ctx context.Context, target hostTarget, cred credential) (bool, error) {
+		return true, nil
 	}
 
 	cfg.dialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
@@ -192,6 +201,9 @@ func TestProcessHostsInvalidHost(t *testing.T) {
 
 func TestProcessHostsUsesFallbackPorts(t *testing.T) {
 	cfg := processingConfig{port: 22, workers: 1, probeTimeout: 5 * time.Millisecond}
+	cfg.authenticator = func(ctx context.Context, target hostTarget, cred credential) (bool, error) {
+		return true, nil
+	}
 
 	var attempts []string
 	cfg.dialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
@@ -245,5 +257,65 @@ func TestProcessHostsUsesFallbackPorts(t *testing.T) {
 
 	if last := attempts[len(attempts)-1]; last != "192.0.2.10:2200" {
 		t.Fatalf("expected final probe against chosen port, got %s", last)
+	}
+}
+
+func TestProcessHostsFiltersByAuthentication(t *testing.T) {
+	cfg := processingConfig{port: 2222, workers: 2}
+
+	cfg.authenticator = func(ctx context.Context, target hostTarget, cred credential) (bool, error) {
+		return cred.password == "wonder", nil
+	}
+
+	hosts := []string{"192.0.2.20:2222"}
+	credentials := []credential{
+		{user: "alice", password: "wonder"},
+		{user: "bob", password: "builder"},
+	}
+
+	var buf bytes.Buffer
+	writer := bufio.NewWriter(&buf)
+
+	if err := processHosts(cfg, hosts, credentials, writer); err != nil {
+		t.Fatalf("processHosts returned unexpected error: %v", err)
+	}
+
+	if err := writer.Flush(); err != nil {
+		t.Fatalf("failed to flush writer: %v", err)
+	}
+
+	lines := strings.Split(strings.TrimSpace(buf.String()), "\n")
+
+	expected := []string{"192.0.2.20|2222|alice|wonder"}
+	if len(lines) != len(expected) {
+		t.Fatalf("expected %d authenticated credentials, got %d: %v", len(expected), len(lines), lines)
+	}
+
+	if lines[0] != expected[0] {
+		t.Fatalf("unexpected credential line: %q", lines[0])
+	}
+}
+
+func TestProcessHostsAuthenticationError(t *testing.T) {
+	cfg := processingConfig{port: 22, workers: 1}
+
+	expectedErr := fmt.Errorf("authenticator failed")
+	cfg.authenticator = func(ctx context.Context, target hostTarget, cred credential) (bool, error) {
+		return false, expectedErr
+	}
+
+	hosts := []string{"192.0.2.30:22"}
+	credentials := []credential{{user: "user", password: "pass"}}
+
+	var buf bytes.Buffer
+	writer := bufio.NewWriter(&buf)
+
+	err := processHosts(cfg, hosts, credentials, writer)
+	if err == nil {
+		t.Fatal("expected authenticator error, got nil")
+	}
+
+	if !strings.Contains(err.Error(), expectedErr.Error()) {
+		t.Fatalf("unexpected authenticator error: %v", err)
 	}
 }
